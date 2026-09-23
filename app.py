@@ -1,396 +1,284 @@
-"""Интерфейс: сценарии в один клик, схема работы, карточки, вывод и ход работы агента.
-
-Запуск: streamlit run app.py
-"""
+"""PODBOR: one-screen event matching with a verifiable tool-using agent."""
 from __future__ import annotations
 
 import html
+import json
 import os
 import time
+from dataclasses import asdict
 from datetime import date, timedelta
 from pathlib import Path
 
 import streamlit as st
 
-from matcher.agent import run_agent
+from matcher import llm
+from matcher.agent import AgentReport, run_agent
 from matcher.data import CALENDAR_END, CALENDAR_START, DEFAULT_CSV, catalog_version, load_catalog
-from matcher.engine import (
-    FOUND, INVALID_QUERY, NO_CATEGORY_IN_CITY, NONE_PASS, REASON_TITLES,
-    Query, compare_dates, fmt_date, fmt_money, hours_word, match,
-)
-from matcher.explain import apply_fallback
+from matcher.engine import FOUND, NONE_PASS, NO_CATEGORY_IN_CITY, INVALID_QUERY, REASON_TITLES, Query, compare_dates, fmt_date, fmt_money, match
+from matcher.explain import apply_fallback, evidence_for
+from matcher.variants import VariantRegistry, query_dict
 
-
-def _load_env_file() -> None:
-    """Читает локальный .env (он в .gitignore). Уже заданные переменные не перезаписывает."""
-    env = Path(__file__).resolve().parent / ".env"
-    if not env.exists():
-        return
-    for line in env.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        v = v.strip().strip('"').strip("'")
-        if v:
-            os.environ.setdefault(k.strip(), v)
-
-
-_load_env_file()
-
-FORMATS = ["свадьба", "той", "корпоратив", "конференция", "юбилей", "день рождения"]
-LANGS = ["не важно", "русский", "казахский", "английский"]
+ROOT = Path(__file__).resolve().parent
 E = html.escape
 
-# Сценарии для демонстрации: только заполняют форму, алгоритм о них не знает
-PRESETS = {
-    "Ведущий на корпоратив": dict(city="Алматы", category="Ведущий", date=date(2026, 10, 10),
-                                  fmt="корпоратив", budget=1_000_000, hours=5, lang="русский"),
-    "То же, 11 октября": dict(city="Алматы", category="Ведущий", date=date(2026, 10, 11),
-                              fmt="корпоратив", budget=1_000_000, hours=5, lang="русский"),
-    "Редкая: флорист": dict(city="Алматы", category="Флорист", date=date(2026, 10, 10),
-                            fmt="корпоратив", budget=250_000, hours=8, lang="русский"),
-    "Декабрь: все заняты": dict(city="Астана", category="Ведущий", date=date(2026, 12, 24),
-                                fmt="корпоратив", budget=1_000_000, hours=5, lang="русский"),
-    "Нет категории в городе": dict(city="Астана", category="Декоратор", date=date(2026, 10, 10),
-                                   fmt="корпоратив", budget=1_000_000, hours=5, lang="русский"),
-}
 
-st.set_page_config(page_title="Подбор подрядчиков · ИИ-агент", page_icon="🎯", layout="wide")
+def load_env():
+    path = ROOT / '.env'
+    allowed = {'LLM_PROVIDER', 'LLM_MODEL', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'AGENT_DEADLINE', 'LLM_ENABLED'}
+    if path.exists():
+        for line in path.read_text(encoding='utf-8-sig').splitlines():
+            if '=' in line and not line.lstrip().startswith('#'):
+                k, v = line.split('=', 1)
+                if k.strip() in allowed and v.strip():
+                    os.environ.setdefault(k.strip(), v.strip().strip('\"\''))
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
-html, body, [class*="css"], .stMarkdown, .stButton button, input, textarea, select {
-  font-family: 'Manrope', 'Segoe UI', Arial, sans-serif !important;
-}
-.block-container {padding-top: 1.6rem; max-width: 1240px;}
-[data-testid="stSidebar"] {border-right: 1px solid #E4E1D6;}
-[data-testid="stSidebar"] .stButton button {width: 100%; text-align: left; justify-content: flex-start;
-  border: 1px solid #DAD6C8; background: #FFFFFF; font-weight: 600; padding: .45rem .75rem;}
-[data-testid="stSidebar"] .stButton button:hover {border-color: #0F6E66; color: #0F6E66;}
 
-.hero h1 {font-size: 2.05rem; font-weight: 800; letter-spacing: -.02em; margin: 0 0 .25rem 0; color:#141B26;}
-.hero p {font-size: 1.1rem; color: #4A5261; margin: 0 0 .9rem 0;}
-.pipe {display:flex; gap:.6rem; align-items:stretch; margin-bottom: 1.3rem; flex-wrap: wrap;}
-.pipe .st {flex:1 1 220px; background:#FFFFFF; border:1px solid #E4E1D6; border-radius:12px; padding:.7rem .9rem;}
-.pipe .n {display:inline-block; width:1.5rem; height:1.5rem; border-radius:50%; background:#0F6E66; color:#fff;
-  text-align:center; font-weight:700; font-size:.85rem; line-height:1.5rem; margin-right:.4rem;}
-.pipe .t {font-weight:700; color:#141B26;}
-.pipe .d {font-size:.85rem; color:#5B6372; margin-top:.15rem; margin-left:1.95rem;}
-.pipe .arrow {align-self:center; color:#A9A391; font-size:1.3rem;}
-
-.status {border-radius:12px; padding:1rem 1.2rem; margin: .2rem 0 1rem 0; border-left: 6px solid;}
-.status .h {font-size:1.35rem; font-weight:800; letter-spacing:-.01em;}
-.status .s {font-size:1rem; margin-top:.15rem;}
-.st-found {background:#E9F4EE; border-color:#1F8A4C; color:#123D25;}
-.st-none {background:#FBEAEA; border-color:#C0392B; color:#5A1A13;}
-.st-nocat {background:#FDF4E3; border-color:#D08A12; color:#5A3B05;}
-.st-invalid {background:#EEF0F4; border-color:#6B7385; color:#2A3140;}
-
-.advice {background:#FFFFFF; border:1px solid #CFE3DF; border-radius:12px; padding:.9rem 1.1rem; margin-bottom:1rem;}
-.advice .h {font-weight:800; color:#0F6E66; margin-bottom:.25rem;}
-.advice.pending {border-style:dashed; color:#5B6372;}
-
-.card-h {display:flex; align-items:center; gap:.55rem; margin-bottom:.15rem;}
-.rank {background:#141B26; color:#fff; border-radius:8px; font-weight:800; padding:.05rem .5rem; font-size:.95rem;}
-.name {font-size:1.25rem; font-weight:800; color:#141B26; line-height:1.2;}
-.meta {color:#6A7282; font-size:.85rem; margin-bottom:.45rem;}
-.price {font-size:1.45rem; font-weight:800; color:#141B26; margin:.15rem 0 .1rem 0;}
-.price small {font-size:.78rem; font-weight:500; color:#7A8292; margin-left:.35rem;}
-.chips {margin:.5rem 0 .2rem 0;}
-.chip {display:inline-block; border-radius:999px; padding:.12rem .55rem; font-size:.8rem; margin:0 .3rem .3rem 0; font-weight:600;}
-.chip-ok {background:#E6F2EC; color:#17603A;}
-.chip-na {background:#EEF0F4; color:#3F4757;}
-.chip-warn {background:#FCEFD9; color:#7A4E07;}
-.chip-real {background:#E3EEF9; color:#1D4E80;}
-.chip-bad {background:#FBE3E1; color:#8A2318;}
-.src {font-size:.78rem; color:#7A8292; margin-top:.35rem;}
-.src.llm {color:#0F6E66; font-weight:600;}
-
-.trace {display:flex; flex-wrap:wrap; gap:.4rem; align-items:center; margin:.3rem 0 .6rem 0;}
-.step {background:#FFFFFF; border:1px solid #E4E1D6; border-radius:10px; padding:.35rem .6rem; font-size:.84rem;}
-.step b {color:#141B26;}
-.step .ms {color:#8A91A0; margin-left:.3rem;}
-.step.err {border-color:#E3B4AE; background:#FDF1EF;}
-.step.ok {border-color:#B8D8CC; background:#EEF7F3;}
-.tarrow {color:#A9A391;}
-.rej {font-size:.92rem; margin:.15rem 0;}
-.foot {color:#7A8292; font-size:.8rem;}
-</style>
-""", unsafe_allow_html=True)
+load_env()
+st.set_page_config(page_title='PODBOR — ваш event, ваши условия', page_icon='◈', layout='wide')
+st.markdown((ROOT / 'assets' / 'style.html').read_text(encoding='utf-8'), unsafe_allow_html=True)
 
 
 @st.cache_resource
-def get_catalog():
-    return load_catalog(DEFAULT_CSV), catalog_version(DEFAULT_CSV)
+def read_catalog(version):
+    return load_catalog()
 
 
-@st.cache_resource
-def warm_up_llm():
-    # Загрузка SDK модели при открытии страницы, а не при первом запросе
-    from matcher import llm
-    return llm.warm_up()
-
-
-catalog, version = get_catalog()
-warm_up_llm()
+version = catalog_version()
+catalog = read_catalog(version)
+prov = llm.provider()
+has_ai = llm.has_key(prov) and os.getenv('LLM_ENABLED', '1') != '0'
+if has_ai:
+    llm.warm_up()
 cities = sorted({c.city for c in catalog})
-categories = sorted({x for c in catalog for x in c.categories})
+categories = sorted({cat for c in catalog for cat in c.categories})
+formats = ['корпоратив', 'свадьба', 'той', 'конференция', 'юбилей', 'день рождения']
+languages = ['Не важно', 'русский', 'казахский', 'английский']
+
+DEFAULT = dict(city='Алматы', category='Ведущий', day=date(2026, 10, 10), fmt='корпоратив', budget=1_000_000, hours=5, language='русский', wish='')
+PRESETS = {
+    'Ведущий · 10 октября': DEFAULT,
+    'Та же задача · 11 октября': {**DEFAULT, 'day': date(2026, 10, 11)},
+    'Флорист · один вариант': {**DEFAULT, 'category': 'Флорист', 'budget': 250_000, 'hours': 8},
+    'Декабрь · все заняты': {**DEFAULT, 'city': 'Астана', 'day': date(2026, 12, 24)},
+    'Декоратор · нет в городе': {**DEFAULT, 'city': 'Астана', 'category': 'Декоратор'},
+    'Зал · нужен другой бюджет': {**DEFAULT, 'category': 'Банкетный зал', 'day': date(2026, 10, 7)},
+}
+for key, value in DEFAULT.items():
+    st.session_state.setdefault('q_' + key, value)
 
 
-def agent_status() -> str:
-    from matcher import llm
-    p = llm.provider()
-    if os.getenv("LLM_ENABLED", "1") == "0":
-        return "⚪ Агент отключён — резервный режим"
-    if not llm.has_key(p):
-        return f"⚪ Нет ключа {llm.KEY_VARS[p]} — резервный режим"
-    return f"🟢 ИИ-агент: {llm.model_name(p)}"
+def preset_change():
+    name = st.session_state.example
+    if name in PRESETS:
+        for k, v in PRESETS[name].items():
+            st.session_state['q_' + k] = v
+        st.session_state.run_requested = True
 
 
-# ---------- форма и сценарии ----------
-DEFAULTS = dict(city="Алматы", category="Ведущий", date=date(2026, 10, 10), fmt="корпоратив",
-                budget=1_000_000, hours=5, lang="русский", wish="")
-for k, v in DEFAULTS.items():
-    st.session_state.setdefault(f"f_{k}", v)
-
-
-def apply_preset(name: str) -> None:
-    for k, v in PRESETS[name].items():
-        st.session_state[f"f_{k}"] = v
-    st.session_state["f_wish"] = ""
-    st.session_state["autorun"] = True
+def apply_variant(q):
+    values = dict(city=q.city, category=q.category, day=q.event_date, fmt=q.event_format,
+                  budget=q.budget, hours=q.hours or 0, language=q.language or 'Не важно', wish=q.wish)
+    for k, v in values.items():
+        st.session_state['q_' + k] = v
+    st.session_state.run_requested = True
+    st.session_state.example = 'Свой запрос'
 
 
 with st.sidebar:
-    st.markdown("### Примеры")
-    for name in PRESETS:
-        st.button(name, key=f"p_{name}", on_click=apply_preset, args=(name,))
-    st.markdown("### Свой запрос")
-    with st.form("query"):
-        city = st.selectbox("Город", cities, key="f_city")
-        category = st.selectbox("Категория", categories, key="f_category")
-        event_date = st.date_input("Дата", min_value=date(2026, 1, 1), max_value=date(2027, 12, 31),
-                                   format="DD.MM.YYYY", key="f_date",
-                                   help=f"Занятость известна на {fmt_date(CALENDAR_START)}–{fmt_date(CALENDAR_END)}")
-        event_format = st.selectbox("Мероприятие", FORMATS, key="f_fmt")
-        budget = st.number_input("Бюджет, ₸", min_value=0, step=50_000, key="f_budget")
-        hours = st.number_input("Часов (0 — не важно)", min_value=0, max_value=24, key="f_hours")
-        language = st.selectbox("Язык", LANGS, key="f_lang")
-        wish = st.text_input("Пожелание (необязательно)", placeholder="живой юмор, терраса…", key="f_wish")
-        submitted = st.form_submit_button("Подобрать", type="primary", use_container_width=True)
-    st.caption(agent_status())
-
-# ---------- шапка ----------
-st.markdown("""
-<div class="hero">
-  <h1>Подбор event-подрядчиков с ИИ-агентом</h1>
-  <p>До трёх исполнителей из каталога вашего города — и чем каждый отличается.</p>
-</div>
-<div class="pipe">
-  <div class="st"><span class="n">1</span><span class="t">Код отбирает</span><div class="d">дата, бюджет, формат, язык, часы</div></div>
-  <div class="arrow">→</div>
-  <div class="st"><span class="n">2</span><span class="t">ИИ-агент анализирует</span><div class="d">сравнивает, ищет варианты</div></div>
-  <div class="arrow">→</div>
-  <div class="st"><span class="n">3</span><span class="t">Код проверяет агента</span><div class="d">каждое число и факт</div></div>
-</div>
-""", unsafe_allow_html=True)
+    st.markdown('<div class="brand"><span class="brand-mark">◈</span> PODBOR<span class="brand-ai">AI</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="side-caption">EVENT-ПОДРЯДЧИКИ КАЗАХСТАНА</div>', unsafe_allow_html=True)
+    st.selectbox('Быстрые примеры', ['Свой запрос', *PRESETS], key='example', on_change=preset_change)
+    st.markdown('### Ваше мероприятие')
+    with st.form('request'):
+        st.selectbox('Город', cities, key='q_city')
+        st.selectbox('Кого ищем', categories, key='q_category')
+        st.date_input('Дата', key='q_day', min_value=CALENDAR_START, max_value=CALENDAR_END, format='DD.MM.YYYY')
+        st.selectbox('Формат', formats, key='q_fmt')
+        st.number_input('Бюджет на подрядчика, ₸', min_value=1, max_value=100_000_000, step=50_000, key='q_budget')
+        c1, c2 = st.columns([1, 1.2])
+        with c1:
+            st.number_input('Часов', min_value=0, max_value=24, key='q_hours', help='0 — не ограничивать длительность')
+        with c2:
+            st.selectbox('Язык', languages, key='q_language')
+        st.text_input('Что для вас важно?', placeholder='Например: спокойная подача', key='q_wish', max_chars=300,
+                      help='Пожелание помогает сравнить описания; выполнение пожелания не гарантируется.')
+        submit = st.form_submit_button('Найти подрядчиков →', type='primary', use_container_width=True)
+    st.caption('Календарь: 23 сентября — 31 декабря 2026. Цена «от» требует уточнения.')
+    with st.expander('Подключение AI'):
+        st.write(f'Модель: {llm.model_name(prov)}')
+        st.caption('Ключ настроен. Реальный статус появится после запроса.' if has_ai else 'Сейчас работает локальный режим. Добавьте свой ключ в .env по инструкции README.')
+        st.caption('Ключ не нужно вводить в интерфейсе или отправлять в чат.')
 
 
-# ---------- отрисовка результата ----------
+def current_query():
+    s = st.session_state
+    return Query(s.q_city, s.q_day, s.q_fmt, s.q_category, int(s.q_budget), int(s.q_hours) or None,
+                 None if s.q_language == 'Не важно' else s.q_language, s.q_wish.strip())
 
-def match_chips(card, q) -> list[tuple[str, str]]:
-    """Совпадения с запросом, проверенные кодом: есть в каждой карточке независимо от агента."""
+
+def pill(text, cls=''):
+    return f'<span class="pill {cls}">{E(str(text))}</span>'
+
+
+st.markdown('''<div class="hero"><div class="eyebrow">МЕНЬШЕ ПОИСКА. БОЛЬШЕ ЯСНОСТИ.</div>
+<h1>Ваше событие.<br><span>Ваши три кандидата.</span></h1>
+<p>Кто подходит, чем отличается и что изменить, если никто не подошёл.</p></div>
+<div class="journey"><span><b>01</b> Проверяем условия</span><i>→</i><span><b>02</b> AI выбирает аргументы</span><i>→</i><span><b>03</b> Вы принимаете решение</span></div>''', unsafe_allow_html=True)
+
+
+def draw_card(card, q):
     c = card.contractor
-    left = q.budget - c.price_from
-    chips = [("ok", f"свободен {q.event_date.strftime('%d.%m')}"),
-             ("ok", "без запаса бюджета" if left == 0 else f"запас {fmt_money(left)}"),
-             ("ok", q.event_format)]
+    headroom = q.budget - c.price_from
+    accent = 'card-top' if card.rank == 1 else ''
+    badges = pill(f'Свободен {q.event_date:%d.%m}', 'mint') + pill(q.event_format)
     if q.language:
-        chips.append(("ok", q.language))
+        badges += pill(q.language)
     if q.hours:
-        chips.append(("na", "часы не важны") if c.max_hours is None else ("ok", f"до {c.max_hours} ч"))
-    return chips
-
-
-def data_chips(card) -> list[tuple[str, str]]:
-    """Только предупреждения: синтетический профиль, проставленные цена или город."""
-    c = card.contractor
-    out = [("warn", "синтетический профиль")] if c.synthetic else []
+        badges += pill(f'до {c.max_hours} ч' if c.max_hours is not None else 'Часы не применимы')
+    notes = ''
+    if c.synthetic:
+        notes += pill('Синтетический профиль', 'amber')
     if c.price_imputed:
-        out.append(("warn", "цену уточнить"))
+        notes += pill('Цена проставлена', 'amber')
     if c.city_imputed:
-        out.append(("warn", "город уточнить"))
-    return out
+        notes += pill('Город проставлен', 'amber')
+    source = 'Аргументы выбрал AI · ссылки проверены' if card.explanation_source == 'llm' else 'Объяснение из данных каталога'
+    body = f'''<article class="candidate {accent}"><div class="candidate-top"><span class="rank">0{card.rank}</span><span class="small-label">СООТВЕТСТВУЕТ УСЛОВИЯМ</span></div>
+    <h3>{E(c.name)}</h3><div class="location">{E(q.category)} · {E(c.city)}</div>
+    <div class="price"><small>от</small> {E(fmt_money(c.price_from))}</div>
+    <div class="headroom">{'Без запаса до бюджета' if not headroom else 'До бюджета остаётся ' + E(fmt_money(headroom))}</div>
+    <div class="pills">{badges}</div><div class="reason-title">ПОЧЕМУ В ВЫБОРКЕ</div>
+    <p class="explanation">{E(card.explanation)}</p><div class="data-notes">{notes}</div>
+    <div class="source">{E(source)}</div></article>'''
+    st.markdown(body, unsafe_allow_html=True)
+    with st.expander(f'Источники и позиция №{card.rank}'):
+        st.caption(f'ID: {c.id}. Баллы — соответствие запросу и полнота данных, не рейтинг качества.')
+        for label, points in card.score_parts:
+            st.write(f'+{points} · {label}')
+        st.write('Описание автора профиля:')
+        st.text(c.description)
+        for note in card.data_notes:
+            st.caption(note)
 
 
-def chips_html(chips) -> str:
-    return "".join(f'<span class="chip chip-{k}">{E(t)}</span>' for k, t in chips)
-
-
-def render_status(result) -> None:
-    kind, title = {
-        FOUND: ("found", "Подобрали"),
-        NO_CATEGORY_IN_CITY: ("nocat", "В этом городе такой категории нет"),
-        NONE_PASS: ("none", "Кандидаты есть, но ни один не проходит по условиям"),
-        INVALID_QUERY: ("invalid", "Не можем проверить запрос"),
-    }[result.status]
-    st.markdown(f'<div class="status st-{kind}"><div class="h">{E(title)}</div>'
-                f'<div class="s">{E(result.headline)}</div></div>', unsafe_allow_html=True)
-
-
-def render_card(card, q) -> None:
-    c = card.contractor
-    with st.container(border=True):
-        warn = data_chips(card)
-        st.markdown(
-            f'<div class="card-h"><span class="rank">{card.rank}</span><span class="name">{E(c.name)}</span></div>'
-            f'<div class="price">от {E(fmt_money(c.price_from))}</div>'
-            f'<div class="chips">{chips_html(match_chips(card, q))}{chips_html(warn)}</div>',
-            unsafe_allow_html=True)
-        st.markdown(card.explanation)
-        src = "🤖 ИИ-агент, проверено кодом" if card.explanation_source == "llm" else "из фактов профиля"
-        st.markdown(f'<div class="src{" llm" if card.explanation_source == "llm" else ""}">{src}</div>',
-                    unsafe_allow_html=True)
-        with st.expander(f"Почему №{card.rank} · {card.score} б."):
-            for label, pts in card.score_parts:
-                st.markdown(f"+{pts} · {label}")
-            if card.differences:
-                st.markdown("**Отличия:** " + "; ".join(card.differences) + ".")
-            st.caption(f"{c.id} · описание автора профиля: {c.description}")
-
-
-def render_trace(report) -> None:
-    parts = []
-    for stp in report.steps:
-        if stp.tool == "основной поиск (код)":
-            parts.append('<span class="step ok"><b>🔎 Поиск кодом</b></span>')
-        elif stp.tool == "submit_answer":
-            parts.append(f'<span class="step ok"><b>✅ Ответ сдан</b><span class="ms">{stp.ms} мс</span></span>')
-        elif stp.tool in ("вызов модели", "лимит"):
-            parts.append(f'<span class="step err"><b>⚠ {E(stp.result)}</b></span>')
-        else:
-            args = ", ".join(f"{k}={v}" for k, v in stp.args.items())
-            ms = f'<span class="ms">{stp.ms} мс</span>' if stp.ms else ""
-            parts.append(f'<span class="step"><b>🧰 {E(stp.tool)}</b>({E(args)}) → {E(stp.result)}{ms}</span>')
-    st.markdown('<div class="trace">' + '<span class="tarrow">→</span>'.join(parts) + '</div>',
-                unsafe_allow_html=True)
-
-
-def plan_label(result) -> str:
-    """Короткая подпись плана, который код задаёт агенту (см. matcher.agent.plan_for)."""
-    if result.status == NO_CATEGORY_IN_CITY:
-        return "категории в городе нет: агент смотрит другие города"
-    if result.status == FOUND and result.passed_count >= 3:
-        return "подходящих достаточно: агент сразу сравнивает"
-    if result.status == FOUND:
-        return "подходящих мало: агент проверяет другие условия"
-    return "никто не подходит: агент ищет, что изменить"
-
-
-def render(result, report, t_match: float, total: float, pending: bool) -> None:
+def draw_result(result, report, elapsed, pending=False):
     q = result.query
-    render_status(result)
-
-    # вывод агента
+    conditions = [q.city, q.category, fmt_date(q.event_date), q.event_format, 'до ' + fmt_money(q.budget)]
+    if q.hours:
+        conditions.append(f'{q.hours} ч')
+    if q.language:
+        conditions.append(q.language)
+    st.markdown('<div class="request-line"><span class="tiny-label">ВАШ ЗАПРОС</span><div>' + ''.join(pill(x) for x in conditions) + '</div></div>', unsafe_allow_html=True)
+    if q.wish:
+        st.caption('Пожелание: ' + q.wish)
+    if result.status == FOUND:
+        title = f'{result.passed_count} подходят. Сравните {len(result.cards)}.' if result.passed_count >= 3 else f'Подходит {result.passed_count} из {result.pool_size}.'
+        subtitle = 'Дата, бюджет и обязательные условия проверены по каталогу.'
+        color = 'success'
+    elif result.status == NO_CATEGORY_IN_CITY:
+        title, subtitle, color = 'Такой категории в городе пока нет.', result.headline, 'empty'
+    elif result.status == INVALID_QUERY:
+        title, subtitle, color = 'Уточните условия запроса.', result.headline, 'empty'
+    else:
+        title, subtitle, color = 'Сейчас нет совпадений. Есть следующий шаг.', result.headline, 'empty'
+    st.markdown(f'<div class="result-title {color}"><h2>{E(title)}</h2><p>{E(subtitle)}</p></div>', unsafe_allow_html=True)
     if pending:
-        st.markdown('<div class="advice pending"><div class="h">⏳ ИИ-агент анализирует…</div>'
-                    'Карточки уже проверены кодом, тексты агента появятся через несколько секунд.</div>',
-                    unsafe_allow_html=True)
-    elif report and report.summary:
-        title = "Как выбрать" if result.cards else "Что можно сделать"
-        st.markdown(f'<div class="advice"><div class="h">🤖 {title}</div>{E(report.summary)}</div>',
-                    unsafe_allow_html=True)
-
-    # карточки рядом
+        st.caption('◌ AI изучает аргументы и проверяет варианты. Основной подбор уже готов.')
     if result.cards:
-        cols = st.columns(3)
+        cols = st.columns(len(result.cards))
         for col, card in zip(cols, result.cards):
             with col:
-                render_card(card, q)
-        st.caption("Цена «от» — итоговая смета может быть выше. Отметки совпадений проверены кодом.")
-
-    # почему не остальные / почему никто
-    if result.status in (FOUND, NONE_PASS) and result.rejected:
-        title = "Почему не остальные" if result.status == FOUND else "Почему никто не подошёл"
-        with st.expander(f"{title} — {len(result.rejected)} из {result.pool_size}",
-                         expanded=result.status == NONE_PASS or result.passed_count < 3):
-            for ch in result.rejected:
-                chips = [("bad", REASON_TITLES[r]) for r in ch.failed]
-                st.markdown(f'<div class="rej"><b>{E(ch.contractor.name)}</b> '
-                            f'<span class="meta">от {E(fmt_money(ch.contractor.price_from))}</span> '
-                            f'{chips_html(chips)}</div>', unsafe_allow_html=True)
-            st.caption("Один подрядчик может не пройти сразу по нескольким условиям.")
-    if result.not_shown:
-        st.caption("Тоже проходят условия, но ниже по баллу: " + ", ".join(result.not_shown) + ".")
-
-    if result.alternatives:
-        with st.container(border=True):
-            st.markdown("**Что можно изменить**")
-            for a in result.alternatives:
-                st.markdown(f"- {a.text}")
-
+                draw_card(card, q)
+        st.caption('Цена «от» — не окончательная смета. Утверждения в описаниях принадлежат авторам профилей.')
     if pending:
-        return  # интерактивные элементы — только в окончательном виде
-
-    # ход работы агента
-    if report and report.steps:
-        st.markdown(f"**Ход работы ИИ-агента** · {plan_label(result)}")
-        render_trace(report)
-
+        return
+    registry = VariantRegistry(catalog, q)
+    options = []
+    if report and report.recommendations:
+        # Recheck even cached report before showing executable actions.
+        for v in report.recommendations:
+            fresh = registry.register(v.query)
+            if fresh.passed_count:
+                options.append(fresh)
+    options_from_agent = bool(options)
+    if not options and result.status in (NONE_PASS, FOUND) and result.passed_count < 3:
+        options = registry.suggestions(limit=3)
+    if options:
+        st.markdown('<div class="section-heading"><span class="eyebrow">ЕСТЬ РЕШЕНИЕ</span><h3>Измените условия — увидите кандидатов</h3></div>', unsafe_allow_html=True)
+        st.caption('AI выбрал варианты; каждый повторно проверен по всем условиям.' if options_from_agent else 'Варианты рассчитаны кодом. Все изменения внутри одной строки применяются вместе.')
+        for idx, v in enumerate(options[:3]):
+            with st.container(border=True):
+                left, right = st.columns([4, 1])
+                with left:
+                    st.write(v.text)
+                with right:
+                    st.button('Применить →', key=f'variant_{idx}_{v.id}', on_click=apply_variant, args=(v.query,), use_container_width=True)
+    elif result.status == NONE_PASS:
+        st.info('Среди проверенных изменений решения нет. Можно вручную изменить формат или категорию. Подходящих исполнителей мы не добавляем искусственно.')
+    if result.status == NO_CATEGORY_IN_CITY:
+        elsewhere = sorted({c.city for c in catalog if q.category in c.categories})
+        if elsewhere:
+            st.info('Категория есть в: ' + ', '.join(elsewhere) + '. Это наличие профилей; остальные условия нужно проверить отдельно.')
+    if result.rejected:
+        with st.expander(f'Почему не остальные · {len(result.rejected)} из {result.pool_size}'):
+            for rejected in result.rejected:
+                reasons = ''.join(pill(REASON_TITLES[r], 'rose') for r in rejected.failed)
+                st.markdown(f'<div class="rejected"><div><strong>{E(rejected.contractor.name)}</strong><span>от {E(fmt_money(rejected.contractor.price_from))}</span></div><div class="pills">{reasons}</div></div>', unsafe_allow_html=True)
+            st.caption('Причины могут пересекаться: у одного профиля бывает несколько ограничений.')
+    if result.not_shown:
+        st.caption('Тоже соответствуют условиям: ' + ', '.join(result.not_shown) + '. Равные баллы разрешаются по ID.')
     if result.status in (FOUND, NONE_PASS):
-        with st.expander("Сравнить с другой датой"):
-            other = st.date_input("Другая дата", value=min(q.event_date + timedelta(days=1), CALENDAR_END),
-                                  min_value=CALENDAR_START, max_value=CALENDAR_END, format="DD.MM.YYYY",
-                                  key="cmp_date")
+        with st.expander('Что изменится на другую дату?'):
+            other = st.date_input('Сравнить с датой', value=min(q.event_date + timedelta(days=1), CALENDAR_END),
+                                  min_value=CALENDAR_START, max_value=CALENDAR_END, format='DD.MM.YYYY', key='compare_' + q.event_date.isoformat())
             lines = compare_dates(catalog, q, other)
-            if other == q.event_date:
-                st.caption("Выберите другую дату.")
-            elif lines:
+            if lines:
                 for line in lines:
-                    st.markdown(f"- {line}")
+                    st.write('• ' + line)
             else:
-                st.markdown("Состав подходящих не меняется: по занятости эти даты одинаковы.")
+                st.caption('Набор подходящих при остальных исходных условиях не меняется.')
+    mode = ('AI: аргументы и варианты по ссылкам' if report.mode == 'agent' else 'AI частично · часть ответа отклонена' if report.mode == 'partial' else 'Локальный режим · факты каталога')
+    timer = 'повтор из кэша' if report.cached else f'{elapsed:.2f} с'
+    st.markdown(f'<div class="footer-status"><span class="status-dot"></span>{E(mode)}<span class="footer-right">{E(timer)} · каталог {E(version)}</span></div>', unsafe_allow_html=True)
+    with st.expander('Для жюри: как работает подбор и AI-агент'):
+        st.write('**CSV → строгие ограничения → стабильное ранжирование → AI выбирает ссылки на аргументы и проверяет варианты → код проверяет ссылки → результат.**')
+        st.caption('AI не меняет порядок карточек. Свободный текст модели не публикуется; это ограничение защиты от выдуманных рекомендаций. Описания профилей остаются заявлениями их авторов.')
+        if report.reason:
+            st.info(report.reason)
+        st.write(f'Модель: {report.model or "не вызывалась"}. AI: {report.latency_ms} мс. Полный подбор: {elapsed:.2f} с.')
+        for step in report.steps:
+            st.write(f'**{step.tool}** · {step.result}')
+            if step.args:
+                st.json(step.args, expanded=False)
+        if report.tested_variants:
+            st.json(report.tested_variants, expanded=False)
+        st.caption(f'{len(catalog)} профилей · {len(categories)} категорий · синтетических: {sum(c.synthetic for c in catalog)}. На показанном запросе подходят {result.passed_count}, показаны {len(result.cards)}.')
+    export = {'query': query_dict(q), 'catalog_version': version, 'status': result.status,
+              'passed_count': result.passed_count, 'cards': [{'id': c.contractor.id, 'name': c.contractor.name,
+              'price_from_kzt': c.contractor.price_from, 'explanation': c.explanation} for c in result.cards],
+              'alternatives': [v.public() for v in options], 'ai_mode': report.mode}
+    st.download_button('Скачать результат · JSON', json.dumps(export, ensure_ascii=False, indent=2), 'podbor-result.json', 'application/json')
 
-    if report.mode == "agent":
-        cached = "повтор запроса" in (report.reason or "")
-        mode_text = f"ИИ-агент {report.model} · " + ("ответ из кэша" if cached else f"{report.latency_ms / 1000:.1f} с")
-    elif report.mode == "partial":
-        mode_text = f"ИИ-агент частично: {report.reason}"
-    else:
-        mode_text = f"резервный режим: {report.reason}"
-    st.markdown(f'<div class="foot">{E(mode_text)} · данные {E(version)}</div>', unsafe_allow_html=True)
 
-
-# ---------- запуск подбора ----------
+run_now = submit or st.session_state.pop('run_requested', False)
 area = st.empty()
-run_now = submitted or st.session_state.pop("autorun", False)
-
-if run_now:
-    s = st.session_state
-    q = Query(city=s.f_city, event_date=s.f_date, event_format=s.f_fmt, category=s.f_category,
-              budget=int(s.f_budget), hours=int(s.f_hours) or None,
-              language=None if s.f_lang == "не важно" else s.f_lang, wish=(s.f_wish or "").strip())
-    t0 = time.perf_counter()
+if 'last' not in st.session_state and not run_now:
+    # Useful first screen without spending an API call on a page visit.
+    q = current_query()
+    start = time.perf_counter()
     result = match(catalog, q)
-    t_match = time.perf_counter() - t0
+    report = run_agent(catalog, result, use_llm=False)
+    report.reason = 'Стартовый пример рассчитан локально. Нажмите «Найти подрядчиков», чтобы запустить AI.'
+    st.session_state.last = (result, report, time.perf_counter() - start)
+if run_now:
+    q = current_query()
+    start = time.perf_counter()
+    result = match(catalog, q)
     apply_fallback(result.cards, q)
     with area.container():
-        render(result, None, t_match, 0.0, pending=True)
-    try:
-        report = run_agent(catalog, result)
-    except Exception as e:  # последняя страховка: демонстрация не должна падать
-        from matcher.agent import AgentReport
-        apply_fallback(result.cards, q)
-        report = AgentReport("fallback", f"внутренняя ошибка агента ({type(e).__name__})")
-    total = time.perf_counter() - t0
-    st.session_state["last"] = (result, report, t_match, total)
+        draw_result(result, None, 0, pending=True)
+    report = run_agent(catalog, result)
+    st.session_state.last = (result, report, time.perf_counter() - start)
     area.empty()
-
-if "last" not in st.session_state:
-    area.info("← Выберите пример слева или заполните свой запрос.")
-    st.stop()
-
 with area.container():
-    render(*st.session_state["last"], pending=False)
+    draw_result(*st.session_state.last)
