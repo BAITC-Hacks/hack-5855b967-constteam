@@ -1,0 +1,32 @@
+[
+  {
+    "name": "1. Плотная категория, осень: ведущий на корпоратив",
+    "query": {"city": "Алматы", "event_date": "2026-10-10", "event_format": "корпоратив", "category": "Ведущий",
+              "budget": 1000000, "language": "русский", "hours": 5},
+    "expect": {"status": "found", "passed_count": 4}
+  },
+  {
+    "name": "2. Тот же запрос на следующий день — другой состав из-за занятости",
+    "query": {"city": "Алматы", "event_date": "2026-10-11", "event_format": "корпоратив", "category": "Ведущий",
+              "budget": 1000000, "language": "русский", "hours": 5},
+    "expect": {"status": "found", "passed_count": 4, "differs_from": 0}
+  },
+  {
+    "name": "3. Редкая категория: флорист, max_hours пустой",
+    "query": {"city": "Алматы", "event_date": "2026-10-10", "event_format": "корпоратив", "category": "Флорист",
+              "budget": 250000, "language": "русский", "hours": 8},
+    "expect": {"status": "found", "passed_count": 1, "ids": ["HK-39372"]}
+  },
+  {
+    "name": "4. Декабрь: категория есть, но все заняты",
+    "query": {"city": "Астана", "event_date": "2026-12-24", "event_format": "корпоратив", "category": "Ведущий",
+              "budget": 1000000, "language": "русский", "hours": 5},
+    "expect": {"status": "none_pass", "passed_count": 0}
+  },
+  {
+    "name": "5. Категории нет в городе",
+    "query": {"city": "Астана", "event_date": "2026-10-10", "event_format": "корпоратив", "category": "Декоратор",
+              "budget": 1000000, "language": "русский", "hours": 5},
+    "expect": {"status": "no_category", "passed_count": 0}
+  }
+]
